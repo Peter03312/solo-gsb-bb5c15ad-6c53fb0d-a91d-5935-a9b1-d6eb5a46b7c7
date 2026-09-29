@@ -33,9 +33,17 @@ async function api(path, options = {}) {
   const data = text ? JSON.parse(text) : null;
   if (!res.ok) {
     const detail = data && (data.detail || data.message);
-    const msg = typeof detail === "string"
-      ? detail
-      : (detail && detail.message) || `请求失败 (${res.status})`;
+    let msg;
+    if (typeof detail === "string") {
+      msg = detail;
+    } else if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+      msg = detail.message || `请求失败 (${res.status})`;
+    } else if (Array.isArray(detail) && detail.length) {
+      // Pydantic 校验错误：detail=[{msg,...}]，msg 已包含中文业务原因
+      msg = detail.map((e) => e.msg).filter(Boolean).join("；") || `请求失败 (${res.status})`;
+    } else {
+      msg = `请求失败 (${res.status})`;
+    }
     const err = new Error(msg);
     err.status = res.status;
     err.data = data;
@@ -519,6 +527,7 @@ function renderPlanList() {
       actions.append(
         actionBtn("编辑", "btn-small", () => editPlan(p)),
         actionBtn("⚡ 推演", "btn-small btn-primary", () => simulatePlan(p).catch((e) => toast(e.message, true))),
+        actionBtn("🧪 插入评估", "btn-small", () => openInsertionModal(p)),
         actionBtn("📦 规则版本", "btn-small", () => openPlanVersions(p)),
         actionBtn("导出 JSON", "btn-small", () => exportPlan(p.id)),
         actionBtn("删除", "btn-small btn-danger", () => removePlan(p)),
@@ -739,6 +748,254 @@ function syncImportCommitBtn() {
 }
 
 $("#btnOpenImport").addEventListener("click", openImportModal);
+
+/* ---------------- 待加试剂插入位置评估（纯预览） ---------------- */
+
+let insertionData = null;  // 最近一次插入评估结果
+
+function openInsertionModal(plan) {
+  insertionData = null;
+  const n = plan.steps.length;
+  const options = state.reagents
+    .map((r) => `<option value="${r.id}">${escapeHtml(r.name)}（${r.categories.map((c) => escapeHtml(catLabel(c))).join("/") || "无类别"}）</option>`)
+    .join("");
+  pushModal(`
+    <button class="btn btn-ghost modal-close">✕ 关闭</button>
+    <h3>🧪 待加试剂插入位置评估 · ${escapeHtml(plan.name)}</h3>
+    <p class="hint">评估<b>一股待加试剂</b>插在该方案的<b>首位 / 相邻步骤之间 / 末尾</b>（共 ${n + 1} 个位置）
+      哪个更合适。系统沿用该方案<b>当前生效规则版本</b>${plan.effective_rule_version ? `（规则 v${plan.effective_rule_version.version_no} 生效中）` : "（无生效版本，使用全局启用规则图）"}
+      对每个位置逐一预演，按首次严重（high）即中止的口径返回首次危险、被阻断的原步骤与命中依据。
+      <b>仅预览</b>：不保存步骤、不记录推演、不要求安全确认。</p>
+    <div class="form">
+      <div class="form-row">
+        <label class="ins-source">试剂来源
+          <select id="insSource">
+            <option value="archive">档案试剂</option>
+            <option value="temporary">临时试剂（填写名称 + 类别）</option>
+          </select>
+        </label>
+        <label class="ins-amount">用量 (mL/g)
+          <input type="number" id="insAmount" min="0" step="0.1" placeholder="必须为正数，如 20" />
+        </label>
+      </div>
+      <div id="insArchiveBox">
+        <label>选择档案试剂
+          <select id="insReagentId"><option value="">— 选择试剂档案 —</option>${options}</select>
+        </label>
+      </div>
+      <div id="insTempBox" class="hidden">
+        <label>临时试剂名
+          <input type="text" id="insName" maxlength="128" placeholder="如：新配制的混合试剂" />
+        </label>
+        <label>相容性类别（至少一个，逗号分隔英文 key）
+          <input type="text" id="insCats" placeholder="如 strong_acid, oxidizer" />
+        </label>
+      </div>
+      <label>备注（可选）
+        <input type="text" id="insNote" maxlength="500" placeholder="加液方式 / 注意事项" />
+      </label>
+      <div class="form-actions">
+        <button type="button" class="btn btn-primary" id="btnInsEval">🔍 逐一预演全部位置</button>
+      </div>
+    </div>
+    <div id="insResult"></div>
+  `);
+
+  $("#insSource").addEventListener("change", () => {
+    const isArchive = $("#insSource").value === "archive";
+    $("#insArchiveBox").classList.toggle("hidden", !isArchive);
+    $("#insTempBox").classList.toggle("hidden", isArchive);
+  });
+
+  $("#btnInsEval").addEventListener("click", () => runInsertionEval(plan));
+}
+
+async function runInsertionEval(plan) {
+  const isArchive = $("#insSource").value === "archive";
+  const amountRaw = $("#insAmount").value;
+  const amount = Number(amountRaw);
+  if (!(amount > 0)) { toast("用量必须为正数", true); return; }
+  const body = { amount_ml: amount, note: $("#insNote").value.trim() || null };
+  if (isArchive) {
+    const rid = $("#insReagentId").value;
+    if (!rid) { toast("请选择档案试剂", true); return; }
+    body.reagent_id = Number(rid);
+  } else {
+    const name = $("#insName").value.trim();
+    const cats = $("#insCats").value.split(/[,，、;；/]+/).map((s) => s.trim()).filter(Boolean);
+    if (!name) { toast("请填写临时试剂名", true); return; }
+    if (!cats.length) { toast("临时试剂必须填写至少一个非空类别", true); return; }
+    body.reagent_name = name;
+    body.categories = cats;
+  }
+  const btn = $("#btnInsEval");
+  btn.disabled = true; btn.textContent = "预演中…";
+  try {
+    insertionData = await api(`/api/plans/${plan.id}/insertion-preview`, { method: "POST", body });
+    renderInsertionResult(insertionData, plan);
+    toast("全部位置预演完成");
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false; btn.textContent = "🔍 逐一预演全部位置";
+  }
+}
+
+function insStatusBadge(p) {
+  const map = { safe: ["ok", "✅ 相容"], warning: ["medium", "⚠️ 警示"], danger: ["high", "🛑 严重中止"] };
+  const [cls, label] = map[p.status] || ["blocked", p.status];
+  return `<span class="badge badge-${cls}">${label}</span>`;
+}
+
+function renderInsertionResult(d, plan) {
+  const host = $("#insResult");
+  const rec = d.recommendation;
+  const recCls = rec.has_high ? "warning" : "safe";
+  const recIcon = rec.has_high ? "⚠️" : "✅";
+  const cand = d.candidate;
+  const scopeLine = d.rule_scope === "plan_version"
+    ? `方案规则版本 <b>${escapeHtml(d.rule_revision)}</b>`
+    : `全局启用规则图 ${escapeHtml(d.rule_revision)}`;
+  const bl = d.baseline;
+  const baselineLine = bl.halted
+    ? `原方案自身推演 <span class="badge badge-high">🛑 在第 ${bl.first_danger.step + 1} 步中止</span>（阻断 ${bl.blocked_steps.map((x) => x + 1).join("、") || "无"}）`
+    : bl.status === "warning"
+      ? '<span class="badge badge-medium">⚠️ 原方案存在警示但可完整执行</span>'
+      : '<span class="badge badge-ok">✅ 原方案自身相容</span>';
+
+  host.innerHTML = `
+    <div class="report-banner ${recCls}" style="margin-top:14px">
+      <span class="big">${recIcon}</span>
+      <div style="flex:1">
+        <h2>推荐插入：${escapeHtml(rec.position_label)}</h2>
+        <p class="item-meta">候选试剂 <b>${escapeHtml(cand.name)}</b>
+          （${cand.categories.map((c) => `<span class="badge badge-low">${escapeHtml(catLabel(c))}</span>`).join(" ") || "无类别"}，
+          ${cand.amount_ml} mL/g，${cand.source === "archive" ? "档案试剂" : "临时试剂"}）</p>
+        <ul class="m-refs">${rec.reasons.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>
+        <p class="item-meta">判定来源：${scopeLine} · 共 ${d.position_count} 个候选位置 ·
+          ${baselineLine} · <b>纯预览，不落库</b></p>
+      </div>
+    </div>
+    <div class="ins-positions">
+      ${d.positions.map((p) => renderInsertionPosition(p, d)).join("")}
+    </div>`;
+  bindInsertionResultEvents();
+}
+
+function renderInsertionTimeline(p, d) {
+  return p.timeline.map((t) => {
+    const isIns = t.is_inserted;
+    const seq = isIns ? "新" : `原${t.original_index + 1}`;
+    const stateBadge = {
+      ok: '<span class="badge badge-ok">相容</span>',
+      warning: '<span class="badge badge-medium">警示</span>',
+      danger: '<span class="badge badge-high">严重</span>',
+      blocked: '<span class="badge badge-blocked">已阻断</span>',
+    }[t.state] || "";
+    const hitBtns = (t.finding_ids || []).map((fid) => {
+      const f = p.findings.find((x) => x.id === fid);
+      if (!f) return "";
+      return `<button type="button" class="mini-rule ${f.severity} ins-finding" data-pos="${p.position}" data-fid="${fid}">
+        <b>[${f.rule_id}]</b> ${escapeHtml(f.title)} —— 与第 ${f.existing_step} 步「${escapeHtml(f.existing_reagent)}」
+      </button>`;
+    }).join("");
+    return `<li class="tl-item ${t.state}${isIns ? " tl-inserted" : ""}">
+      <span class="tl-dot"></span>
+      <div class="tl-body">
+        <div class="tl-head">
+          <span class="tl-name">${isIns ? "🧪 " : ""}${escapeHtml(t.reagent_name)}
+            <span class="item-meta">[${seq}${isIns ? " 候选" : ""}]</span></span>
+          <span class="tl-badges">${stateBadge}</span>
+        </div>
+        ${t.amount_ml != null ? `<div class="tl-note">${t.amount_ml} mL/g · ${(t.reagent_categories || []).map((c) => escapeHtml(catLabel(c))).join(" / ")}</div>` : ""}
+        <div class="tl-findings">${hitBtns}</div>
+      </div>
+    </li>`;
+  }).join("");
+}
+
+function renderInsertionPosition(p, d) {
+  const isRec = d.recommendation.position === p.position;
+  const fd = p.first_danger;
+  let dangerLine = "";
+  if (fd) {
+    const who = fd.involves_inserted
+      ? `<b>候选「${escapeHtml(fd.reagent_name)}」</b>（插入步）`
+      : `原第 ${fd.step_original_index + 1} 步「${escapeHtml(fd.reagent_name)}」`;
+    const withWho = fd.conflicts_with_original_index == null
+      ? `<b>候选「${escapeHtml(fd.conflicts_with_reagent)}」</b>`
+      : `原第 ${fd.conflicts_with_original_index + 1} 步「${escapeHtml(fd.conflicts_with_reagent)}」`;
+    dangerLine = `
+      <div class="ins-danger">
+        🛑 首次危险：${who} 与 ${withWho} 冲突
+        <button type="button" class="mini-rule high ins-finding" data-pos="${p.position}" data-fid="${fd.finding_id}">
+          <b>[${fd.rule_id}]</b> ${escapeHtml(fd.title)}
+        </button>
+      </div>`;
+  }
+  const blockedLine = p.blocked_original_count
+    ? `<span class="badge badge-blocked">被阻断原步骤 ${p.blocked_original_count}：${p.blocked_original_steps.map((x) => x + 1).join("、")}</span>`
+    : '<span class="badge badge-ok">原步骤全部可执行</span>';
+  const warnLine = p.warning_finding_count
+    ? `<span class="badge badge-medium">警示命中 ${p.warning_finding_count}</span>`
+    : '<span class="badge badge-ok">无警示命中</span>';
+  const hitCount = p.findings.length;
+  return `
+    <details class="ins-pos ${isRec ? "ins-pos-rec" : ""}" ${isRec ? "open" : ""}>
+      <summary>
+        <span class="ins-pos-label">${isRec ? "⭐ " : ""}位置 ${p.position + 1} · ${escapeHtml(p.position_label)}</span>
+        ${insStatusBadge(p)}
+        ${blockedLine}
+        ${warnLine}
+        ${p.low_finding_count ? `<span class="badge badge-low">提示 ${p.low_finding_count}</span>` : ""}
+        <span class="item-meta">命中 ${hitCount} 条</span>
+      </summary>
+      <div class="ins-pos-body">
+        ${dangerLine}
+        <p class="item-meta">候选试剂加入步状态：<b>${p.inserted_step.state_label}</b>
+          （${p.executed_original_count}/${d.original_step_count} 个原步骤未被阻断）</p>
+        <ul class="timeline">${renderInsertionTimeline(p, d)}</ul>
+        <div class="finding-list">
+          ${p.findings.length
+            ? p.findings.map((f) => `
+              <div class="finding-card ${f.severity} ins-finding" data-pos="${p.position}" data-fid="${f.id}" style="cursor:pointer">
+                <div class="fc-title"><span class="badge badge-${f.severity}">${f.severity_label}</span>
+                  [${f.rule_id}] ${escapeHtml(f.title)}</div>
+                <div class="fc-meta">第 ${f.incoming_step} 步「${escapeHtml(f.incoming_reagent)}」
+                  ⚠ 第 ${f.existing_step} 步「${escapeHtml(f.existing_reagent)}」 · 点击查看方程式 / 机理 / 文献</div>
+              </div>`).join("")
+            : '<p class="hint">该位置推演未命中任何相容性禁忌。</p>'}
+        </div>
+      </div>
+    </details>`;
+}
+
+function bindInsertionResultEvents() {
+  if (!insertionData) return;
+  $$(".ins-finding", $("#modalBox")).forEach((el) => {
+    el.onclick = () => {
+      const p = insertionData.positions.find((x) => x.position === Number(el.dataset.pos));
+      const f = p && p.findings.find((x) => x.id === el.dataset.fid);
+      if (f) pushModal(`
+        <button class="btn btn-ghost modal-close">← 返回位置评估</button>
+        <h3><span class="badge badge-${f.severity}">${f.severity_label}</span> [${f.rule_id}] ${escapeHtml(f.title)}</h3>
+        <p class="hint">位置：${escapeHtml(p.position_label)}</p>
+        <div class="m-row"><div class="m-k">反应 / 现象</div><div class="m-eq">${escapeHtml(f.reaction)}</div></div>
+        <div class="m-row"><div class="m-k">判定依据（机理）</div><div>${escapeHtml(f.rationale).replace(/\n/g, "<br>")}</div></div>
+        <div class="m-row"><div class="m-k">参与步骤（可追溯）</div>
+          <div>第 ${f.incoming_step} 步加入「${escapeHtml(f.incoming_reagent)}」，类别 <b>${escapeHtml(catLabel(f.incoming_category))}</b><br>
+          与体系中第 ${f.existing_step} 步已加入的「${escapeHtml(f.existing_reagent)}」，类别 <b>${escapeHtml(catLabel(f.existing_category))}</b> 匹配<br>
+          匹配方向：${f.match_direction === "incoming->existing" ? "新加入 → 已存在" : "已存在 → 新加入"}
+          ${f.rule_directional ? "（有向规则）" : "（无向规则，双向等价）"}</div>
+        </div>
+        <div class="m-row"><div class="m-k">参考文献</div>
+          <ul class="m-refs">${(f.references || []).map((r) => `<li>· ${escapeHtml(r)}</li>`).join("") || "<li>无</li>"}</ul>
+        </div>
+        <div class="m-row m-k">规则图版本 ${escapeHtml(insertionData.rule_revision)}</div>
+      `);
+    };
+  });
+}
 
 /* ---------------- 废液分桶规划 ---------------- */
 
@@ -1144,8 +1401,40 @@ function closeModal() {
   $("#modalBackdrop").classList.add("hidden");
   $("#modalBox").classList.remove("modal-wide");
 }
-$("#modalBackdrop").addEventListener("click", (e) => { if (e.target === $("#modalBackdrop")) closeModal(); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
+$("#modalBackdrop").addEventListener("click", (e) => {
+  if (e.target !== $("#modalBackdrop")) return;
+  if (modalStack.length) { modalStack.length = 0; closeModal(); }
+  else closeModal();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (modalStack.length) popModal();
+  else closeModal();
+});
+
+// 弹层栈：在某弹层内再打开子弹层（如插入评估内查看命中依据）时，
+// 关闭子弹层可回到上一层内容。普通单层弹层使用 openModal/closeModal 不受影响。
+const modalStack = [];
+function pushModal(html, wide = true) {
+  modalStack.push(html);
+  $("#modalBox").innerHTML = html;
+  $("#modalBackdrop").classList.remove("hidden");
+  $("#modalBox").classList.toggle("modal-wide", wide);
+  const closeBtn = $(".modal-close", $("#modalBox"));
+  if (closeBtn) closeBtn.addEventListener("click", popModal);
+}
+function popModal() {
+  modalStack.pop();
+  if (modalStack.length) {
+    $("#modalBox").innerHTML = modalStack[modalStack.length - 1];
+    $("#modalBox").classList.add("modal-wide");
+    const closeBtn = $(".modal-close", $("#modalBox"));
+    if (closeBtn) closeBtn.addEventListener("click", popModal);
+    bindInsertionResultEvents();
+  } else {
+    closeModal();
+  }
+}
 
 function openFindingModal(f, revision) {
   openModal(`

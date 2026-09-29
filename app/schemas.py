@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Severity = Literal["low", "medium", "high"]
 
@@ -242,6 +242,48 @@ class BucketingPreviewIn(BaseModel):
 
     capacity_ml: float = Field(gt=0, le=10_000_000)
     streams: list[WasteStreamIn] = Field(min_length=1, max_length=12)
+
+
+# ---------- 待加试剂插入位置评估（纯预览） ----------
+
+class InsertionCandidateIn(BaseModel):
+    """待加试剂：输入档案试剂 ID，或临时试剂名 + 非空类别；二者互斥。"""
+
+    reagent_id: Optional[int] = None
+    reagent_name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    categories: Optional[list[str]] = None
+    amount_ml: float = Field(gt=0, le=10_000_000)  # 必须为正数
+    note: Optional[str] = Field(default=None, max_length=500)
+
+    @field_validator("reagent_name", mode="before")
+    @classmethod
+    def _clean_name(cls, value):
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+
+    @field_validator("categories", mode="before")
+    @classmethod
+    def _clean_categories(cls, value):
+        if value is None:
+            return None
+        cleaned: list[str] = []
+        for item in value:
+            key = str(item).strip()[:64]
+            if key and key not in cleaned:
+                cleaned.append(key)
+        return cleaned
+
+    @model_validator(mode="after")
+    def _validate_source(self):
+        if self.reagent_id is not None and self.reagent_name is not None:
+            raise ValueError("不能同时指定档案试剂与临时试剂名，请只选一种来源")
+        if self.reagent_id is None and self.reagent_name is None:
+            raise ValueError("必须选择档案试剂（reagent_id）或填写临时试剂名（reagent_name）")
+        if self.reagent_id is None and not self.categories:
+            raise ValueError("临时试剂必须填写至少一个非空相容性类别")
+        return self
 
 
 # ---------- 方案 CSV 导入 ----------

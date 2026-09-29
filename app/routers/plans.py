@@ -5,10 +5,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from .. import models, safety, versioning
+from .. import insertion, models, safety, versioning
 from ..database import get_db
-from ..deduce import _step_categories, build_report, persist_run
-from ..schemas import PlanCreate, PlanOut, PlanUpdate, StepOut, StepSafetyUpdate
+from ..deduce import _step_categories, build_report, persist_run, resolve_rule_source
+from ..schemas import (
+    InsertionCandidateIn,
+    PlanCreate,
+    PlanOut,
+    PlanUpdate,
+    StepOut,
+    StepSafetyUpdate,
+)
 
 router = APIRouter(prefix="/api/plans", tags=["plans"])
 
@@ -209,6 +216,56 @@ def simulate_dry(plan_in: PlanCreate, db: Session = Depends(get_db)):
     report, _ = build_report(db, plan)
     report["plan_id"] = None
     return report
+
+
+@router.post("/{plan_id}/insertion-preview")
+def insertion_preview(
+    plan_id: int,
+    payload: InsertionCandidateIn,
+    db: Session = Depends(get_db),
+):
+    """评估一股待加试剂插在已保存方案的哪个位置更合适（纯预览）。
+
+    - 候选试剂二选一：档案试剂（reagent_id）或临时试剂名 + 非空类别；
+      用量必须为正数；
+    - 对首位、相邻步骤之间、末尾共 n+1 个位置逐一跑完整推演，
+      沿用方案当前生效规则版本（无则全局启用规则图）；
+    - 每个位置返回首次危险、被阻断的原步骤与命中依据；
+      推荐优先选无 high 的位置，否则选被阻断原步骤最少者，
+      再按警示命中数少、位置靠前决胜；
+    - 不落库：不新增 / 修改步骤，不保存推演记录，不检查安全确认门槛。
+    """
+    plan = db.get(models.Plan, plan_id)
+    if plan is None:
+        raise HTTPException(404, "方案不存在")
+
+    if payload.reagent_id is not None:
+        reagent = db.get(models.Reagent, payload.reagent_id)
+        if reagent is None:
+            raise HTTPException(404, f"试剂 id={payload.reagent_id} 不存在")
+        candidate = {
+            "source": "archive",
+            "reagent_id": reagent.id,
+            "name": reagent.name,
+            "categories": json.loads(reagent.categories or "[]"),
+            "amount_ml": payload.amount_ml,
+            "note": payload.note,
+        }
+    else:
+        candidate = {
+            "source": "temporary",
+            "reagent_id": None,
+            "name": payload.reagent_name,
+            "categories": payload.categories,
+            "amount_ml": payload.amount_ml,
+            "note": payload.note,
+        }
+
+    rules, revision, resolved_vid, scope = resolve_rule_source(db, plan)
+    return insertion.evaluate_insertion(
+        db, plan, candidate, rules, revision, resolved_vid, scope
+    )
+
 
 
 @router.put("/{plan_id}/steps/{step_id}/safety")

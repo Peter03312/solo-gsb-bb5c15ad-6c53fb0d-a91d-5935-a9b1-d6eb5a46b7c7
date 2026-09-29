@@ -605,3 +605,31 @@ textarea { resize: vertical; }
   .merge-sides { flex-direction: column; }
   .merge-arrow { transform: rotate(90deg); }
 }
+
+/* ---------------- 待加试剂插入位置评估 ---------------- */
+.ins-positions { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+.ins-pos {
+  border: 1px solid var(--line); border-radius: 10px; background: #fff; overflow: hidden;
+}
+.ins-pos-rec {
+  border: 2px solid #2f9e44; box-shadow: 0 2px 10px rgba(47, 158, 68, 0.18);
+}
+.ins-pos > summary {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  padding: 10px 14px; cursor: pointer; list-style: none; user-select: none;
+  background: #f8fafc;
+}
+.ins-pos > summary::-webkit-details-marker { display: none; }
+.ins-pos-rec > summary { background: #ebfbee; }
+.ins-pos-label { font-weight: 600; margin-right: auto; }
+.ins-pos-body { padding: 12px 14px; border-top: 1px solid var(--line); }
+.ins-danger {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  background: #fff5f5; border: 1px solid #ffc9c9; border-radius: 8px;
+  padding: 8px 12px; margin-bottom: 10px; font-size: 0.92rem;
+}
+.tl-inserted .tl-body {
+  border-color: #2f9e44; background: #f4fcf6; box-shadow: inset 3px 0 0 #2f9e44;
+}
+.ins-source { max-width: 260px; }
+.ins-amount { max-width: 200px; }
